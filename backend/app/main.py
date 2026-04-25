@@ -16,6 +16,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import settings
 from app.database.session import init_db
+from app.redis_client import close_redis, get_redis
 from app.api import designs, checkpoints, collaborate
 from app.api import simulation as sim_router
 from app.auth import oauth
@@ -26,9 +27,16 @@ async def lifespan(app: FastAPI):
     """Run startup / shutdown logic."""
     # ── Startup ─────────────────────────────────────────────────
     await init_db()
+    try:
+        await get_redis().ping()
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Redis unavailable on startup — token blacklisting will be skipped."
+        )
     yield
     # ── Shutdown ────────────────────────────────────────────────
-    # Nothing to tear down for now; connection pools are GC'd by SQLAlchemy.
+    await close_redis()
 
 
 app = FastAPI(
