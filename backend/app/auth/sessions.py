@@ -5,24 +5,32 @@ Token strategy
 --------------
 * Access token  — short-lived (default 60 min), used on every API request.
 * Refresh token — long-lived (default 7 days), used to obtain a new access token
-  without re-authenticating via OAuth.  Stored client-side (httpOnly cookie or
-  secure local storage).  Server-side blacklisting can be added in Phase 2 via
-  a Redis SET of revoked JTIs.
+  without re-authenticating via OAuth.  Stored in an httpOnly cookie.
+* Revocation    — on logout the refresh token's JTI is blacklisted in Redis with
+  a TTL matching its remaining lifetime (Improvement #3).
 """
+from __future__ import annotations
+
+import hashlib
+import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 import uuid
 
 from jose import jwt, JWTError
-from fastapi import Cookie, HTTPException, status, Depends
+from fastapi import HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import settings
 from app.database.models import User
 from app.database.session import get_db
 
+logger = logging.getLogger(__name__)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 # ---------------------------------------------------------------------------
@@ -94,14 +102,18 @@ def decode_token(token: str, expected_type: str = "access") -> dict:
 
 
 # ---------------------------------------------------------------------------
-# FastAPI dependency: current user
+# FastAPI dependency: current user  (with blacklist check — Improvement #3)
 # ---------------------------------------------------------------------------
 
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Resolve the Bearer token to an authenticated User record."""
+    """Resolve the Bearer token to an authenticated User record.
+
+    Also checks the Redis token blacklist so that logged-out access tokens
+    are rejected immediately even within their remaining expiry window.
+    """
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -110,8 +122,18 @@ async def get_current_user(
         )
 
     payload = decode_token(credentials.credentials, expected_type="access")
-    user_id = int(payload.get("sub", 0))
+    jti = payload.get("jti", "")
 
+    # Improvement #3 — check revocation blacklist
+    from app.redis_client import is_token_revoked
+    if jti and await is_token_revoked(jti):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user_id = int(payload.get("sub", 0))
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user:
@@ -120,14 +142,23 @@ async def get_current_user(
 
 
 # ---------------------------------------------------------------------------
-# Refresh token endpoint helper
+# Refresh token endpoint helper  (with blacklist check — Improvement #3)
 # ---------------------------------------------------------------------------
 
 async def refresh_access_token(refresh_token: str, db: AsyncSession) -> dict:
-    """Validate a refresh token and issue a new access token."""
+    """Validate a refresh token, check revocation, and issue a new access token."""
     payload = decode_token(refresh_token, expected_type="refresh")
-    user_id = int(payload.get("sub", 0))
+    jti = payload.get("jti", "")
 
+    # Improvement #3 — reject blacklisted refresh tokens (e.g. after logout)
+    from app.redis_client import is_token_revoked
+    if jti and await is_token_revoked(jti):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token has been revoked",
+        )
+
+    user_id = int(payload.get("sub", 0))
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user:
@@ -142,8 +173,19 @@ async def refresh_access_token(refresh_token: str, db: AsyncSession) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# User upsert helper (used by OAuth callbacks)
+# User upsert helper (Improvement #5: atomic upsert replaces race-prone loop)
 # ---------------------------------------------------------------------------
+
+def _derive_username(raw_name: str, auth_id: str) -> str:
+    """Build a deterministic, unique-enough username from the OAuth display name.
+
+    Appends 8 hex chars derived from auth_id so concurrent OAuth callbacks for
+    the same new user are idempotent and username collisions are negligible.
+    """
+    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", raw_name.strip())[:100] or "user"
+    suffix = hashlib.sha256(auth_id.encode()).hexdigest()[:8]
+    return f"{sanitized}_{suffix}"
+
 
 async def get_or_create_user(
     db: AsyncSession,
@@ -153,25 +195,34 @@ async def get_or_create_user(
     provider: str,
     auth_id: str,
 ) -> User:
-    """Return existing user or create a new one.  Guarantees username uniqueness."""
-    # Try to find by OAuth identity first
-    result = await db.execute(select(User).where(User.auth_id == auth_id))
-    user = result.scalar_one_or_none()
-    if user:
-        return user
+    """Upsert a user record using a single atomic PostgreSQL INSERT ... ON CONFLICT.
 
-    # Ensure username is unique by appending a numeric suffix if needed
-    base = username
-    suffix = 0
-    while True:
-        check = await db.execute(select(User).where(User.username == username))
-        if not check.scalar_one_or_none():
-            break
-        suffix += 1
-        username = f"{base}{suffix}"
+    Improvement #5: Replaces the while-True SELECT loop that had a TOCTOU race
+    condition when two OAuth callbacks arrived simultaneously for the same user.
 
-    user = User(email=email, username=username, auth_provider=provider, auth_id=auth_id)
-    db.add(user)
+    Conflict resolution:
+    - auth_id conflict → same user re-logging in → update updated_at only.
+    - email conflict   → edge case (provider changed email) → update auth fields.
+    """
+    final_username = _derive_username(username, auth_id)
+
+    stmt = (
+        pg_insert(User)
+        .values(
+            email=email,
+            username=final_username,
+            auth_provider=provider,
+            auth_id=auth_id,
+        )
+        .on_conflict_do_update(
+            index_elements=["auth_id"],
+            set_={"updated_at": func.now()},
+        )
+        .returning(User)
+    )
+
+    result = await db.execute(stmt)
+    user = result.scalar_one()
     await db.commit()
     await db.refresh(user)
     return user

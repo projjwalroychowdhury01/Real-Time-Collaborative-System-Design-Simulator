@@ -8,8 +8,18 @@ The .env file is loaded from the *backend/* working directory when running
 `uvicorn app.main:app` directly, or from the root when using Docker Compose
 via `env_file: .env`.
 """
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Known weak placeholder values that must not be used in production.
+_WEAK_JWT_SECRETS = frozenset({
+    "changeme-replace-with-a-long-random-secret",
+    "change-me-to-a-long-random-secret",
+    "changeme",
+    "secret",
+})
 
 
 class Settings(BaseSettings):
@@ -47,5 +57,35 @@ class Settings(BaseSettings):
     FRONTEND_URL: str = "http://localhost:5173"
     DEBUG: bool = True
 
+    # ── Validators ────────────────────────────────────────────────────────────
+
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def validate_database_url(cls, v: str) -> str:
+        """Improvement #9: Enforce asyncpg scheme at startup, not at first DB call."""
+        if not v.startswith("postgresql+asyncpg://"):
+            raise ValueError(
+                "DATABASE_URL must use 'postgresql+asyncpg://' scheme for async "
+                f"SQLAlchemy operation. Got: {v!r}"
+            )
+        return v
+
+    @field_validator("JWT_SECRET_KEY")
+    @classmethod
+    def validate_jwt_secret(cls, v: str) -> str:
+        """Improvement #2: Reject weak or placeholder JWT secrets at startup."""
+        if len(v) < 32:
+            raise ValueError(
+                f"JWT_SECRET_KEY must be at least 32 characters (got {len(v)}). "
+                "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+        if v in _WEAK_JWT_SECRETS:
+            raise ValueError(
+                "JWT_SECRET_KEY is set to a known placeholder value. "
+                "Set a unique random secret in your .env file."
+            )
+        return v
+
 
 settings = Settings()
+
