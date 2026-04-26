@@ -16,6 +16,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import settings
 from app.database.session import init_db
+from app.database.checkpoint_service import start_checkpoint_service, stop_checkpoint_service
 from app.redis_client import close_redis, get_redis
 from app.api import designs, checkpoints, collaborate
 from app.api import simulation as sim_router
@@ -34,8 +35,10 @@ async def lifespan(app: FastAPI):
         logging.getLogger(__name__).warning(
             "Redis unavailable on startup — token blacklisting will be skipped."
         )
+    start_checkpoint_service()
     yield
     # ── Shutdown ────────────────────────────────────────────────
+    await stop_checkpoint_service()
     await close_redis()
 
 
