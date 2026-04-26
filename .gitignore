@@ -10,6 +10,9 @@ node_modules/
 docs
 .env.example
 
+graphify-out
+gemini.md
+settings.json
 
 # Distribution / packaging
 .Python
